@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Bank statements
+*.pdf
+*.xlsx
+*.xls
+
+# Output files
+financial_diary.xlsx
+
+# OS files
+.DS_Store
+Thumbs.db
