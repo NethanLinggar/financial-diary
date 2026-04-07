@@ -71,13 +71,15 @@ TXN_HEADERS = [
     "Description", "Debit (IDR)", "Credit (IDR)", "Balance (IDR)"
 ]
 TXN_WIDTHS = {
-    "A": 6, "B": 13, "C": 10, "D": 10, "E": 24,
+    "A": 6, "B": 13, "C": 10, "D": 10, "E": 30,
     "F": 50, "G": 18, "H": 18, "I": 18,
 }
 SUMM_WIDTHS = {
     "A": 28, "B": 10, "C": 18, "D": 18, "E": 18, "F": 16, "G": 22,
     "J": 16, "K": 20, "L": 20, "M": 20,
 }
+
+# Row heights are not set — Google Sheets will autofit on import.
 
 
 # ── Style helpers ─────────────────────────────────────────────────────────────
@@ -149,8 +151,9 @@ def _write_txn_sheet(ws, transactions):
         _data_cell(ws, ri, 3, bank,                      bg, bold=True, align="center")
         _data_cell(ws, ri, 4, txn_type,                  bg, align="center",
                    color=C_DEBIT if txn_type == "Debit" else (C_CREDIT if txn_type == "Credit" else C_NEUTRAL))
-        _data_cell(ws, ri, 5, "",                        bg, align="left")
-        _data_cell(ws, ri, 6, txn.get("description",""), bg, align="left")
+        _data_cell(ws, ri, 5, txn.get("category", ""),  bg, align="left")
+        c = _data_cell(ws, ri, 6, txn.get("description", ""), bg, align="left")
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         _data_cell(ws, ri, 7, txn.get("debit"),          bg, fmt=IDR_FMT0, align="right",
                    color=C_DEBIT if txn.get("debit") else C_NEUTRAL)
         _data_cell(ws, ri, 8, txn.get("credit"),         bg, fmt=IDR_FMT0, align="right",
@@ -175,6 +178,7 @@ def _write_txn_sheet(ws, transactions):
     dv.sqref = f"E2:E{last}"
     ws.add_data_validation(dv)
     _set_widths(ws, TXN_WIDTHS)
+
 
 
 # ── Summary sheet (per month) ─────────────────────────────────────────────────
@@ -345,9 +349,66 @@ def _write_charts(ws, transactions, anchor_row, col_start=10):
     _chart("Balance by Bank Over Time",  [1, 2], f"A{anchor_row + 25}")
 
 
+# ── All-Time Category Summary ─────────────────────────────────────────────────
+
+def _write_alltime_category_section(ws, wb, row):
+    """
+    Appends a category-vs-month net spending table to the All-Time Summary sheet.
+    Net values use a red/black number format to distinguish negative from positive.
+    """
+    txn_sheets = sorted(
+        [(key, name) for name in wb.sheetnames if (key := _sheet_month_key(name))],
+        key=lambda x: x[0]
+    )
+    if not txn_sheets:
+        return
+
+    n_cols = 1 + len(CATEGORIES)
+    _section_header(ws, row, "ALL-TIME SPENDING BY CATEGORY", cols=n_cols)
+    row += 1
+
+    # Header row: Period | [Category] ...
+    _hdr_cell(ws, row, 1, "Period", bg=C_MID_BLUE)
+    for ci, cat in enumerate(CATEGORIES):
+        _hdr_cell(ws, row, 2 + ci, cat, bg=C_MID_BLUE)
+    row += 1
+
+    data_start = row
+    for (year, month), sheet_name in txn_sheets:
+        bg = C_ALT_ROW if (row % 2 == 0) else C_WHITE
+        _data_cell(ws, row, 1, f"{MONTH_NAMES[month]} {year}", bg, align="center", bold=True)
+        for ci, cat in enumerate(CATEGORIES):
+            col    = 2 + ci
+            credit = f"SUMIFS('{sheet_name}'!H:H,'{sheet_name}'!E:E,\"{cat}\")"
+            debit  = f"SUMIFS('{sheet_name}'!G:G,'{sheet_name}'!E:E,\"{cat}\")"
+            c = _data_cell(ws, row, col, f"={credit}-{debit}", bg, fmt=IDR_FMT0, align="right")
+            c.number_format = '#,##0;[Red]-#,##0;"-"'
+        row += 1
+
+    data_end = row - 1
+
+    # Totals row
+    _data_cell(ws, row, 1, "TOTAL", C_DARK_BLUE, bold=True, color=C_WHITE, align="right")
+    for ci in range(len(CATEGORIES)):
+        col        = 2 + ci
+        col_letter = get_column_letter(col)
+        c               = ws.cell(row=row, column=col,
+                            value=f"=SUM({col_letter}{data_start}:{col_letter}{data_end})")
+        c.fill          = _fill(C_DARK_BLUE)
+        c.font          = _font(bold=True, color=C_WHITE)
+        c.border        = THICK_BOT
+        c.number_format = IDR_FMT
+        c.alignment     = _right()
+
+    # Uniform column widths: A (Period) + one per category
+    ws.column_dimensions["A"].width = 22
+    for ci in range(len(CATEGORIES)):
+        ws.column_dimensions[get_column_letter(2 + ci)].width = 22
+
+
 # ── All-Time Summary ──────────────────────────────────────────────────────────
 
-def _write_alltime_sheet(ws, all_transactions):
+def _write_alltime_sheet(ws, wb, all_transactions):
     agg = defaultdict(lambda: {"count": 0, "debit": 0.0, "credit": 0.0,
                                 "last_balance": None, "last_date": None})
     for txn in all_transactions:
@@ -443,19 +504,26 @@ def _write_alltime_sheet(ws, all_transactions):
     ws.merge_cells(f"F{row}:G{row}")
     row += 2
 
-    _set_widths(ws, SUMM_WIDTHS)
-    _write_charts(ws, all_transactions, row)
+    # Section 4: Category breakdown across all months
+    _write_alltime_category_section(ws, wb, row)
+
+    # Set column widths
+    ws.column_dimensions["A"].width = 28
+    for ci in range(1, 8):  # columns B–G
+        ws.column_dimensions[get_column_letter(1 + ci)].width = 22
+
+    chart_col_start = 2 + len(CATEGORIES) + 2
+    _write_charts(ws, all_transactions, row + len(CATEGORIES) + 5, col_start=chart_col_start)
 
 
 # ── Read existing Txn sheet back into transaction dicts ───────────────────────
 
 def _read_txn_sheet(ws):
-    from datetime import date as date_type
     transactions = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         if len(row) < 9:
             continue
-        _, dt, bank, txn_type, _, desc, debit, credit, balance = row[:9]
+        _, dt, bank, txn_type, category, desc, debit, credit, balance = row[:9]
         if bank not in ("BCA", "Mandiri"):
             continue
         if dt is None:
@@ -465,6 +533,7 @@ def _read_txn_sheet(ws):
             "date":        d,
             "bank":        bank,
             "type":        txn_type,
+            "category":    category or "",
             "description": desc or "",
             "debit":       float(debit)   if debit   is not None else None,
             "credit":      float(credit)  if credit  is not None else None,
@@ -504,6 +573,15 @@ def write_diary(transactions, output_path):
     # Load or create workbook
     if os.path.exists(output_path):
         wb = load_workbook(output_path)
+        # Clear explicit row heights and reapply column widths on existing Txn sheets
+        for name in wb.sheetnames:
+            if not name.startswith("Txn - "):
+                continue
+            ws = wb[name]
+            for row in ws.iter_rows(min_row=2, values_only=False):
+                ws.row_dimensions[row[0].row].height = None
+            _set_widths(ws, TXN_WIDTHS)
+
     else:
         wb = Workbook()
         if "Sheet" in wb.sheetnames:
@@ -556,6 +634,6 @@ def write_diary(transactions, output_path):
     # Write All-Time Summary before _Categories
     cat_pos = wb.sheetnames.index(CAT_SHEET)
     ws_all  = wb.create_sheet("All-Time Summary", cat_pos)
-    _write_alltime_sheet(ws_all, all_transactions)
+    _write_alltime_sheet(ws_all, wb, all_transactions)
 
     wb.save(output_path)

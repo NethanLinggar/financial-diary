@@ -16,7 +16,9 @@ import os
 from parsers.bca_pdf import parse_bca_pdf
 from parsers.mandiri_excel import parse_mandiri_excel
 from output.excel_writer import write_diary
+import warnings
 
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 def _decrypt_pdf(path):
     """Prompt for password and return a decrypted copy as a temp file path."""
@@ -26,10 +28,8 @@ def _decrypt_pdf(path):
         print("Error: pikepdf is required for password-protected PDFs. Run: pip install pikepdf")
         sys.exit(1)
 
-    # Check if the PDF is actually encrypted first
     try:
         with pikepdf.open(path) as pdf:
-            # Opened without password — not encrypted
             return path, False
     except pikepdf.PasswordError:
         pass
@@ -45,6 +45,36 @@ def _decrypt_pdf(path):
         sys.exit(1)
 
 
+def _decrypt_excel(path):
+    """
+    Check if an Excel file is password-protected.
+    If so, prompt for the password and return a decrypted file-like object.
+    Returns (stream_or_path, was_encrypted).
+    """
+    try:
+        import msoffcrypto
+    except ImportError:
+        print("Error: msoffcrypto-tool is required for password-protected Excel files. Run: pip install msoffcrypto-tool")
+        sys.exit(1)
+
+    with open(path, "rb") as f:
+        office_file = msoffcrypto.OfficeFile(f)
+
+        if not office_file.is_encrypted():
+            return path, False
+
+        password = getpass.getpass(f"Excel password for '{os.path.basename(path)}': ")
+        try:
+            office_file.load_key(password=password)
+            decrypted = io.BytesIO()
+            office_file.decrypt(decrypted)
+            decrypted.seek(0)
+            return decrypted, True
+        except Exception:
+            print("Error: incorrect password or failed to decrypt Excel file.")
+            sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate monthly financial diary from bank statements.")
     parser.add_argument("--bca", help="Path to BCA e-statement PDF")
@@ -57,6 +87,7 @@ def main():
         sys.exit(1)
 
     transactions = []
+    tmp_files = []  # track temp files to clean up
 
     if args.bca:
         print(f"Parsing BCA PDF: {args.bca}")
@@ -66,8 +97,22 @@ def main():
 
     if args.mandiri:
         path = args.mandiri
-        print(f"Parsing Mandiri Excel: {path}")
-        txns = parse_mandiri_excel(path)
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext in (".xlsx", ".xls", ".xlsm"):
+            print(f"Parsing Mandiri Excel: {path}")
+            source, was_encrypted = _decrypt_excel(path)
+            if was_encrypted:
+                print("  (decrypted successfully)")
+            txns = parse_mandiri_excel(source)
+        else:
+            # Assume PDF
+            print(f"Parsing Mandiri PDF: {path}")
+            source, was_encrypted = _decrypt_pdf(path)
+            if was_encrypted:
+                tmp_files.append(source)
+            txns = parse_mandiri_excel(source)  # swap for parse_mandiri_pdf if you have one
+
         print(f"  → {len(txns)} transactions found")
         transactions.extend(txns)
 
@@ -75,13 +120,19 @@ def main():
         print("No transactions were parsed. Check your input files.")
         sys.exit(1)
 
-    # Sort by date
     transactions.sort(key=lambda t: t["date"])
 
     print(f"\nTotal transactions: {len(transactions)}")
     print(f"Writing diary to: {args.output}")
     write_diary(transactions, args.output)
     print("Done.")
+
+    # Clean up any decrypted temp PDF files
+    for tmp in tmp_files:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
